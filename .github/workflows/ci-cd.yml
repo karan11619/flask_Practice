@@ -1,0 +1,260 @@
+name: Flask CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 913436626979.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: flask-practice
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  ci-cd:
+    name: Test → Build → ECR → Deploy → Health Check
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:8
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MONGO_URI: mongodb://localhost:27017/test_student_db
+
+    steps:
+
+      # ============================================================
+      # 1. CHECKOUT
+      # ============================================================
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      # ============================================================
+      # 2. TEST
+      # ============================================================
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        run: |
+          pytest -v
+
+      # ============================================================
+      # 3. BUILD
+      # ============================================================
+      - name: Build Docker image
+        run: |
+          docker build \
+            --provenance=false \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            .
+
+      # ============================================================
+      # 4. AUTHENTICATE AWS
+      # ============================================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: "913436626979"
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      # ============================================================
+      # 5. PUSH TO ECR
+      # ============================================================
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login \
+              --username AWS \
+              --password-stdin "$ECR_REGISTRY"
+
+      - name: Push image to ECR
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      # ============================================================
+      # 6. DEPLOY TO EC2
+      # ============================================================
+      - name: Prepare SSH key
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          printf '%s\n' "$EC2_SSH_KEY" > "$RUNNER_TEMP/ec2_key"
+          chmod 600 "$RUNNER_TEMP/ec2_key"
+
+      - name: Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=30 \
+            -i "$RUNNER_TEMP/ec2_key" \
+            "$EC2_USER@$EC2_HOST" \
+            bash -s -- "$IMAGE" "$MONGO_URI" <<'REMOTE_SCRIPT'
+
+          set -e
+
+          IMAGE="$1"
+          MONGO_URI="$2"
+
+          echo "Logging in to Amazon ECR..."
+
+          aws ecr get-login-password --region ap-south-1 \
+            | docker login \
+              --username AWS \
+              --password-stdin \
+              913436626979.dkr.ecr.ap-south-1.amazonaws.com
+
+          echo "Pulling image: $IMAGE"
+          docker pull "$IMAGE"
+
+          echo "Creating Docker network if required..."
+          docker network inspect flask-network >/dev/null 2>&1 || \
+            docker network create flask-network
+
+          echo "Ensuring MongoDB container exists..."
+
+          if ! docker ps --format '{{.Names}}' | grep -qx 'flask-mongodb'; then
+
+            if docker ps -a --format '{{.Names}}' | grep -qx 'flask-mongodb'; then
+              docker start flask-mongodb
+            else
+              docker run -d \
+                --name flask-mongodb \
+                --network flask-network \
+                --restart unless-stopped \
+                mongo:8
+            fi
+
+          fi
+
+          echo "Connecting MongoDB to network..."
+          docker network connect flask-network flask-mongodb 2>/dev/null || true
+
+          echo "Stopping previous Flask container..."
+          docker stop flask-app 2>/dev/null || true
+
+          echo "Removing previous Flask container..."
+          docker rm flask-app 2>/dev/null || true
+
+          echo "Starting new Flask container..."
+
+          docker run -d \
+            --name flask-app \
+            --network flask-network \
+            --restart unless-stopped \
+            -p 5000:5000 \
+            -e MONGO_URI="$MONGO_URI" \
+            "$IMAGE"
+
+          echo "Deployment completed."
+
+          REMOTE_SCRIPT
+
+      # ============================================================
+      # 7. HEALTH CHECK
+      # ============================================================
+      - name: Verify deployment health
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          echo "Waiting for Flask application..."
+
+          for i in {1..12}; do
+
+            if curl -fsS \
+              --max-time 10 \
+              "http://$EC2_HOST:5000/health"; then
+
+              echo
+              echo "Health check passed."
+              exit 0
+            fi
+
+            echo "Health check attempt $i failed. Waiting..."
+            sleep 5
+
+          done
+
+          echo "Health check failed."
+          exit 1
+
+      # ============================================================
+      # 8. SUCCESS EMAIL
+      # ============================================================
+      - name: Send success notification
+        if: success()
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "SUCCESS - Flask CI/CD deployment"
+          to: ${{ secrets.MAIL_TO }}
+          from: ${{ secrets.MAIL_FROM }}
+          body: |
+            Flask CI/CD deployment succeeded.
+
+            Repository: ${{ github.repository }}
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+
+            ECR image:
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+            EC2 deployment:
+            Successful
+
+            Health check:
+            PASSED
+
+      # ============================================================
+      # 9. FAILURE EMAIL
+      # ============================================================
+      - name: Send failure notification
+        if: failure()
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "FAILED - Flask CI/CD pipeline"
+          to: ${{ secrets.MAIL_TO }}
+          from: ${{ secrets.MAIL_FROM }}
+          body: |
+            Flask CI/CD pipeline FAILED.
+
+            Repository: ${{ github.repository }}
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+
+            Please open GitHub Actions to inspect the failed stage.

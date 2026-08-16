@@ -61,3 +61,12 @@ def test_delete_student(client):
     response = client.get(f'/delete/{student_id}', follow_redirects=True)
     assert response.status_code == 200
     assert b"Temp User" not in response.data
+
+def test_health():
+    response = app.test_client().get('/health')
+    assert response.status_code == 200
+
+    data = response.get_json()
+
+    assert data["status"] == "healthy"
+    assert data["mongodb"] == "connected"
