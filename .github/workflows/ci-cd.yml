@@ -13,6 +13,7 @@ permissions:
 
 env:
   AWS_REGION: ap-south-1
+  AWS_ACCOUNT_ID: "913436626979"
   ECR_REGISTRY: 913436626979.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: flask-practice
   IMAGE_TAG: ${{ github.sha }}
@@ -62,7 +63,7 @@ jobs:
 
 
   # ============================================================
-  # 2. BUILD + PUSH + DEPLOY
+  # 2. BUILD + ECR + DEPLOY
   # ============================================================
   deploy:
     name: Build → ECR → EC2
@@ -71,16 +72,16 @@ jobs:
 
     steps:
 
-      # --------------------------------------------------------
-      # Checkout
-      # --------------------------------------------------------
+      # ========================================================
+      # CHECKOUT
+      # ========================================================
       - name: Checkout source code
         uses: actions/checkout@v6
 
 
-      # --------------------------------------------------------
-      # Docker Build
-      # --------------------------------------------------------
+      # ========================================================
+      # DOCKER BUILD
+      # ========================================================
       - name: Build Docker image
         run: |
           docker build \
@@ -89,46 +90,49 @@ jobs:
             .
 
 
-      # --------------------------------------------------------
+      # ========================================================
       # AWS OIDC
-      # --------------------------------------------------------
+      # ========================================================
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          allowed-account-ids: "913436626979"
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
 
 
-      # --------------------------------------------------------
-      # Verify AWS authentication
-      # --------------------------------------------------------
+      # ========================================================
+      # VERIFY AWS
+      # ========================================================
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
 
 
-      # --------------------------------------------------------
-      # ECR Login
-      # --------------------------------------------------------
+      # ========================================================
+      # ECR LOGIN
+      # ========================================================
       - name: Login to Amazon ECR
         run: |
           aws ecr get-login-password \
             --region "$AWS_REGION" \
             | docker login \
               --username AWS \
-              --password-stdin "$ECR_REGISTRY"
+              --password-stdin \
+              "$ECR_REGISTRY"
 
 
-      # --------------------------------------------------------
-      # Push image
+      # ========================================================
+      # PUSH TO ECR
       #
-      # ECR repository is IMMUTABLE.
+      # Repository uses IMMUTABLE tags.
       #
-      # If this SHA already exists, skip the push.
-      # --------------------------------------------------------
+      # If this Git SHA already exists, don't push again.
+      # ========================================================
       - name: Push image to ECR
         run: |
+
+          echo "Checking whether image already exists..."
 
           if aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY" \
@@ -145,7 +149,7 @@ jobs:
           else
 
             echo "Image does not exist."
-            echo "Pushing image..."
+            echo "Pushing image to ECR..."
 
             docker push \
               "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
@@ -153,20 +157,21 @@ jobs:
           fi
 
 
-      # --------------------------------------------------------
-      # Prepare SSH key
-      # --------------------------------------------------------
+      # ========================================================
+      # PREPARE SSH KEY
+      # ========================================================
       - name: Prepare EC2 SSH key
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+
         run: |
           printf '%s\n' "$EC2_SSH_KEY" > "$RUNNER_TEMP/ec2_key"
           chmod 600 "$RUNNER_TEMP/ec2_key"
 
 
-      # --------------------------------------------------------
-      # Deploy to EC2
-      # --------------------------------------------------------
+      # ========================================================
+      # DEPLOY TO EC2
+      # ========================================================
       - name: Deploy to EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -177,7 +182,11 @@ jobs:
 
           IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-          echo "Deploying image:"
+          echo "========================================"
+          echo "Deploying Flask application"
+          echo "========================================"
+
+          echo "Image:"
           echo "$IMAGE"
 
           ssh \
@@ -193,10 +202,23 @@ jobs:
           MONGO_URI="$2"
 
           echo "========================================"
-          echo "EC2 Deployment"
+          echo "EC2 Deployment Started"
           echo "========================================"
 
-          echo "Logging into ECR..."
+          echo "Checking Docker..."
+
+          docker --version
+
+          echo "Checking AWS identity..."
+
+          aws sts get-caller-identity
+
+
+          # ======================================================
+          # ECR LOGIN
+          # ======================================================
+
+          echo "Logging in to Amazon ECR..."
 
           aws ecr get-login-password \
             --region ap-south-1 \
@@ -206,35 +228,54 @@ jobs:
               913436626979.dkr.ecr.ap-south-1.amazonaws.com
 
 
+          # ======================================================
+          # PULL NEW IMAGE
+          # ======================================================
+
           echo "Pulling image..."
 
           docker pull "$IMAGE"
 
 
-          echo "Creating Docker network..."
+          # ======================================================
+          # CREATE DOCKER NETWORK
+          # ======================================================
 
-          docker network inspect flask-network \
-            >/dev/null 2>&1 || \
+          echo "Checking Docker network..."
+
+          if ! docker network inspect flask-network >/dev/null 2>&1
+          then
+            echo "Creating flask-network..."
+
             docker network create flask-network
+          else
+            echo "flask-network already exists."
+          fi
 
+
+          # ======================================================
+          # MONGODB
+          # ======================================================
 
           echo "Checking MongoDB container..."
 
           if docker ps --format '{{.Names}}' | grep -qx 'flask-mongodb'
           then
 
-            echo "MongoDB is already running."
+            echo "MongoDB container is already running."
 
           elif docker ps -a --format '{{.Names}}' | grep -qx 'flask-mongodb'
           then
 
-            echo "Starting existing MongoDB container."
+            echo "MongoDB container exists but is stopped."
 
             docker start flask-mongodb
 
           else
 
-            echo "Creating MongoDB container."
+            echo "MongoDB container does not exist."
+
+            echo "Creating MongoDB container..."
 
             docker run -d \
               --name flask-mongodb \
@@ -245,7 +286,11 @@ jobs:
           fi
 
 
-          echo "Connecting MongoDB to network..."
+          # ======================================================
+          # CONNECT MONGODB TO NETWORK
+          # ======================================================
+
+          echo "Connecting MongoDB to flask-network..."
 
           docker network connect \
             flask-network \
@@ -253,15 +298,27 @@ jobs:
             2>/dev/null || true
 
 
+          # ======================================================
+          # STOP OLD FLASK
+          # ======================================================
+
           echo "Stopping existing Flask container..."
 
           docker stop flask-app 2>/dev/null || true
 
 
+          # ======================================================
+          # REMOVE OLD FLASK
+          # ======================================================
+
           echo "Removing existing Flask container..."
 
           docker rm flask-app 2>/dev/null || true
 
+
+          # ======================================================
+          # START NEW FLASK
+          # ======================================================
 
           echo "Starting new Flask container..."
 
@@ -274,25 +331,51 @@ jobs:
             "$IMAGE"
 
 
-          echo "========================================"
-          echo "Deployment completed"
-          echo "========================================"
+          # ======================================================
+          # SHOW CONTAINERS
+          # ======================================================
 
-          echo "Running containers:"
+          echo "========================================"
+          echo "Running containers"
+          echo "========================================"
 
           docker ps
+
+
+          echo "========================================"
+          echo "EC2 Deployment Completed"
+          echo "========================================"
 
           REMOTE_SCRIPT
 
 
-      # --------------------------------------------------------
-      # Health Check
-      # --------------------------------------------------------
+      # ========================================================
+      # HEALTH CHECK
+      #
+      # IMPORTANT:
+      # Run health check INSIDE EC2.
+      #
+      # This avoids depending on GitHub runner -> port 5000.
+      # ========================================================
       - name: Verify deployment health
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
 
         run: |
+
+          echo "========================================"
+          echo "Running Flask health check on EC2"
+          echo "========================================"
+
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=30 \
+            -i "$RUNNER_TEMP/ec2_key" \
+            "$EC2_USER@$EC2_HOST" \
+            bash -s <<'REMOTE_HEALTH_CHECK'
+
+          set -e
 
           echo "Waiting for Flask application..."
 
@@ -306,32 +389,46 @@ jobs:
               --silent \
               --show-error \
               --max-time 10 \
-              "http://$EC2_HOST:5000/health"
+              http://localhost:5000/health
             then
 
               echo
-              echo "Health check PASSED."
+              echo "========================================"
+              echo "HEALTH CHECK PASSED"
+              echo "========================================"
+
               exit 0
 
             fi
 
             echo "Application not ready."
+
             sleep 5
 
           done
 
-          echo "Health check FAILED."
+          echo
+          echo "========================================"
+          echo "HEALTH CHECK FAILED"
+          echo "========================================"
+
+          docker ps
+          docker logs --tail 100 flask-app
+
           exit 1
 
+          REMOTE_HEALTH_CHECK
 
-      # --------------------------------------------------------
-      # Success Email
-      # --------------------------------------------------------
+
+      # ========================================================
+      # SUCCESS EMAIL
+      # ========================================================
       - name: Send success notification
         if: success()
         uses: dawidd6/action-send-mail@v6
 
         with:
+
           server_address: smtp.gmail.com
           server_port: 465
           secure: true
@@ -347,6 +444,8 @@ jobs:
           body: |
             Flask CI/CD deployment succeeded.
 
+            ========================================
+
             Repository:
             ${{ github.repository }}
 
@@ -356,24 +455,29 @@ jobs:
             Commit:
             ${{ github.sha }}
 
-            Docker image:
+            Docker Image:
             ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
-            EC2 deployment:
+            EC2 Deployment:
             SUCCESS
 
-            Health check:
+            Health Check:
             PASSED
 
+            ========================================
 
-      # --------------------------------------------------------
-      # Failure Email
-      # --------------------------------------------------------
+            Deployment completed successfully.
+
+
+      # ========================================================
+      # FAILURE EMAIL
+      # ========================================================
       - name: Send failure notification
         if: failure()
         uses: dawidd6/action-send-mail@v6
 
         with:
+
           server_address: smtp.gmail.com
           server_port: 465
           secure: true
@@ -389,6 +493,8 @@ jobs:
           body: |
             Flask CI/CD pipeline FAILED.
 
+            ========================================
+
             Repository:
             ${{ github.repository }}
 
@@ -398,5 +504,13 @@ jobs:
             Commit:
             ${{ github.sha }}
 
-            Please open GitHub Actions
-            and inspect the failed stage.
+            Docker Image:
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+            Status:
+            FAILED
+
+            ========================================
+
+            Please open GitHub Actions and inspect
+            the failed stage.
