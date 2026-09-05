@@ -863,3 +863,6 @@ flask_Practice/
 This project demonstrates an end-to-end AWS CI/CD workflow for a containerized Flask application.
 
 The deployment is automated from GitHub to Amazon ECR and then to an Amazon Linux EC2 instance. Every deployed Docker image is associated with a Git commit SHA, and the deployment is accepted only after the Flask `/health` endpoint confirms both application and MongoDB connectivity.
+
+
+<!-- Security scan triggered at 2026-09-05 07:38:18 -->
